@@ -86,11 +86,11 @@ impl fmt::Display for EthernetParseError {
 impl std::error::Error for EthernetParseError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SerializeError {
+pub enum SerialiseError {
     BufferTooSmall { actual: usize, required: usize },
 }
 
-impl fmt::Display for SerializeError {
+impl fmt::Display for SerialiseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BufferTooSmall { actual, required } => write!(
@@ -101,7 +101,7 @@ impl fmt::Display for SerializeError {
     }
 }
 
-impl std::error::Error for SerializeError {}
+impl std::error::Error for SerialiseError {}
 
 pub fn parse_eth_frame(data: &[u8]) -> Result<EthernetFrame<'_>, EthernetParseError> {
     let Some((header, payload)) = data.split_at_checked(ETHERNET_HEADER_LEN) else {
@@ -156,11 +156,11 @@ pub fn parse_eth_frame(data: &[u8]) -> Result<EthernetFrame<'_>, EthernetParseEr
 }
 
 impl EthernetFrame<'_> {
-    pub fn write_to(&self, output: &mut [u8]) -> Result<usize, SerializeError> {
+    pub fn write_to(&self, output: &mut [u8]) -> Result<usize, SerialiseError> {
         let required = ETHERNET_HEADER_LEN + self.payload.len();
 
         if output.len() < required {
-            return Err(SerializeError::BufferTooSmall {
+            return Err(SerialiseError::BufferTooSmall {
                 actual: output.len(),
                 required,
             });
@@ -243,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn serializes_the_exact_ethernet_frame() {
+    fn serialises_the_exact_ethernet_frame() {
         let frame = parse_eth_frame(&ARP_REQUEST).unwrap();
         let mut output = [0; ARP_REQUEST.len()];
 
@@ -254,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn serializer_rejects_every_short_buffer_without_modifying_it() {
+    fn serialiser_rejects_every_short_buffer_without_modifying_it() {
         let frame = parse_eth_frame(&ARP_REQUEST).unwrap();
 
         for length in 0..ARP_REQUEST.len() {
@@ -263,7 +263,7 @@ mod tests {
 
             assert_eq!(
                 frame.write_to(&mut output),
-                Err(SerializeError::BufferTooSmall {
+                Err(SerialiseError::BufferTooSmall {
                     actual: length,
                     required: ARP_REQUEST.len(),
                 })
@@ -273,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn serializes_an_unknown_ether_type_and_arbitrary_payload() {
+    fn serialises_an_unknown_ether_type_and_arbitrary_payload() {
         let payload = [0xde, 0xad, 0xbe, 0xef];
         let frame = EthernetFrame {
             destination_mac: MacAddress::BROADCAST,

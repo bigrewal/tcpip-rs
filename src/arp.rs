@@ -173,9 +173,9 @@ impl<'a> ArpPacket<'a> {
         })
     }
 
-    pub fn write_to(&self, output: &mut [u8]) -> Result<usize, crate::SerializeError> {
+    pub fn write_to(&self, output: &mut [u8]) -> Result<usize, crate::SerialiseError> {
         if output.len() < ARP_HEADER_LEN {
-            return Err(crate::SerializeError::BufferTooSmall {
+            return Err(crate::SerialiseError::BufferTooSmall {
                 actual: output.len(),
                 required: ARP_HEADER_LEN,
             });
@@ -404,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn serializes_the_exact_arp_reply() {
+    fn serialises_the_exact_arp_reply() {
         let request = ArpPacket::parse(&ARP_REQUEST).unwrap();
         let reply = build_reply(&request, LOCAL_MAC, LOCAL_IP).unwrap();
         let mut output = [0; ARP_HEADER_LEN];
@@ -416,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn serialized_reply_round_trips_through_the_parser() {
+    fn serialised_reply_round_trips_through_the_parser() {
         let request = ArpPacket::parse(&ARP_REQUEST).unwrap();
         let reply = build_reply(&request, LOCAL_MAC, LOCAL_IP).unwrap();
         let mut output = [0; ARP_HEADER_LEN];
@@ -432,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn serializer_rejects_every_short_buffer_without_modifying_it() {
+    fn serialiser_rejects_every_short_buffer_without_modifying_it() {
         let packet = ArpPacket::parse(&ARP_REQUEST).unwrap();
 
         for length in 0..ARP_HEADER_LEN {
@@ -441,7 +441,7 @@ mod tests {
 
             assert_eq!(
                 packet.write_to(&mut output),
-                Err(crate::SerializeError::BufferTooSmall {
+                Err(crate::SerialiseError::BufferTooSmall {
                     actual: length,
                     required: ARP_HEADER_LEN,
                 })
@@ -451,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn serializer_preserves_an_unknown_operation() {
+    fn serialiser_preserves_an_unknown_operation() {
         let mut input = ARP_REQUEST;
         input[6..8].copy_from_slice(&0x1234_u16.to_be_bytes());
         let packet = ArpPacket::parse(&input).unwrap();
@@ -479,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn serializes_the_exact_ethernet_arp_reply() {
+    fn serialises_the_exact_ethernet_arp_reply() {
         let request = ArpPacket::parse(&ARP_REQUEST).unwrap();
         let reply = build_reply(&request, LOCAL_MAC, LOCAL_IP).unwrap();
         let mut arp_bytes = [0; ARP_HEADER_LEN];
@@ -521,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn serializes_the_exact_built_arp_request() {
+    fn serialises_the_exact_built_arp_request() {
         let request = build_request(TARGET_IP, LOCAL_MAC, LOCAL_IP);
         let mut output = [0; ARP_HEADER_LEN];
 
