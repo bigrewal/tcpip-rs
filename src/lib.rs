@@ -1,11 +1,12 @@
 pub mod arp;
 pub mod checksum;
 pub mod icmp;
+pub mod interface;
 pub mod ipv4;
 
 use std::fmt;
 
-const ETHERNET_HEADER_LEN: usize = 14;
+pub const ETHERNET_HEADER_LEN: usize = 14;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MacAddress([u8; 6]);
