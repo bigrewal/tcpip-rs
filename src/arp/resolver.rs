@@ -95,6 +95,10 @@ impl ArpResolver {
         true
     }
 
+    pub fn cached_mac(&mut self, ip: Ipv4Addr, now: Instant) -> Option<MacAddress> {
+        self.cache.lookup_mac(ip, now)
+    }
+
     pub fn pending_count(&self) -> usize {
         self.pending.len()
     }

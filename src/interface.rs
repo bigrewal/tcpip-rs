@@ -1,7 +1,15 @@
-use std::{fmt, net::Ipv4Addr};
+use std::{
+    fmt,
+    net::Ipv4Addr,
+    time::{Duration, Instant},
+};
 
 use crate::{
     ETHERNET_HEADER_LEN, EtherType, EthernetFrame, EthernetParseError, MacAddress, SerialiseError,
+    arp::{
+        ARP_HEADER_LEN, ArpPacket, ArpParseError, build_reply, cache::ArpCache,
+        resolver::ArpResolver,
+    },
     icmp::{IcmpParseError, build_echo_reply, parse_icmp_message},
     ipv4::{
         IPV4_MIN_HEADER_LEN, Ipv4Packet, Ipv4ParseError, Ipv4Protocol, Ipv4SerialiseError,
@@ -11,12 +19,17 @@ use crate::{
 };
 
 pub const DEFAULT_IPV4_TTL: u8 = 64;
+pub const DEFAULT_ARP_CACHE_CAPACITY: usize = 64;
+pub const DEFAULT_ARP_CACHE_TTL: Duration = Duration::from_secs(60);
+pub const DEFAULT_ARP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+pub const DEFAULT_ARP_MAX_ATTEMPTS: usize = 3;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct NetworkInterface {
     pub mac_address: MacAddress,
     pub ipv4_address: Ipv4Addr,
-    next_ipv4_identification: u16,
+    pub next_ipv4_identification: u16,
+    arp_resolver: ArpResolver,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +39,7 @@ pub enum InterfaceError {
     Icmp(IcmpParseError),
     Serialise(SerialiseError),
     Ipv4Serialise(Ipv4SerialiseError),
+    Arp(ArpParseError),
 }
 
 impl fmt::Display for InterfaceError {
@@ -38,6 +52,7 @@ impl fmt::Display for InterfaceError {
             Self::Ipv4Serialise(error) => {
                 write!(formatter, "could not serialise IPv4 packet: {error}")
             }
+            Self::Arp(error) => write!(formatter, "invalid ARP packet: {error}"),
         }
     }
 }
@@ -50,6 +65,7 @@ impl std::error::Error for InterfaceError {
             Self::Icmp(error) => Some(error),
             Self::Serialise(error) => Some(error),
             Self::Ipv4Serialise(error) => Some(error),
+            Self::Arp(error) => Some(error),
         }
     }
 }
@@ -84,25 +100,79 @@ impl From<Ipv4SerialiseError> for InterfaceError {
     }
 }
 
+impl From<ArpParseError> for InterfaceError {
+    fn from(error: ArpParseError) -> Self {
+        Self::Arp(error)
+    }
+}
+
 impl NetworkInterface {
-    pub const fn new(mac_address: MacAddress, ipv4_address: Ipv4Addr) -> Self {
+    pub fn new(mac_address: MacAddress, ipv4_address: Ipv4Addr) -> Self {
+        Self::with_arp_config(
+            mac_address,
+            ipv4_address,
+            DEFAULT_ARP_CACHE_CAPACITY,
+            DEFAULT_ARP_CACHE_TTL,
+            DEFAULT_ARP_RETRY_INTERVAL,
+            DEFAULT_ARP_MAX_ATTEMPTS,
+        )
+    }
+
+    pub fn with_arp_config(
+        mac_address: MacAddress,
+        ipv4_address: Ipv4Addr,
+        cache_capacity: usize,
+        cache_ttl: Duration,
+        retry_interval: Duration,
+        max_attempts: usize,
+    ) -> Self {
         Self {
             mac_address,
             ipv4_address,
             next_ipv4_identification: 0,
+            arp_resolver: ArpResolver::new(
+                mac_address,
+                ipv4_address,
+                ArpCache::new(cache_capacity, cache_ttl),
+                retry_interval,
+                max_attempts,
+            ),
         }
     }
 
     pub fn process_frame(&mut self, input: &[u8]) -> Result<Option<Vec<u8>>, InterfaceError> {
+        self.process_frame_at(input, Instant::now())
+    }
+
+    pub fn process_frame_at(
+        &mut self,
+        input: &[u8],
+        now: Instant,
+    ) -> Result<Option<Vec<u8>>, InterfaceError> {
         let ethernet = parse_eth_frame(input)?;
 
-        if ethernet.destination_mac != self.mac_address {
-            return Ok(None);
+        match ethernet.ether_type {
+            EtherType::Ipv4 if ethernet.destination_mac == self.mac_address => {
+                self.process_ipv4_frame(&ethernet)
+            }
+            EtherType::Arp
+                if ethernet.destination_mac == self.mac_address
+                    || ethernet.destination_mac == MacAddress::BROADCAST =>
+            {
+                self.process_arp_frame(&ethernet, now)
+            }
+            EtherType::Ipv4 | EtherType::Arp | EtherType::Ipv6 | EtherType::Unknown(_) => Ok(None),
         }
-        if ethernet.ether_type != EtherType::Ipv4 {
-            return Ok(None);
-        }
+    }
 
+    pub fn cached_mac(&mut self, ip: Ipv4Addr, now: Instant) -> Option<MacAddress> {
+        self.arp_resolver.cached_mac(ip, now)
+    }
+
+    fn process_ipv4_frame(
+        &mut self,
+        ethernet: &EthernetFrame<'_>,
+    ) -> Result<Option<Vec<u8>>, InterfaceError> {
         let ipv4 = parse_ipv4_packet(ethernet.payload)?;
 
         if ipv4.destination != self.ipv4_address {
@@ -158,12 +228,42 @@ impl NetworkInterface {
 
         Ok(Some(output))
     }
+
+    fn process_arp_frame(
+        &mut self,
+        ethernet: &EthernetFrame<'_>,
+        now: Instant,
+    ) -> Result<Option<Vec<u8>>, InterfaceError> {
+        let request = ArpPacket::parse(ethernet.payload)?;
+        self.arp_resolver.observe(&request, now);
+
+        let Some(reply) = build_reply(&request, self.mac_address, self.ipv4_address) else {
+            return Ok(None);
+        };
+
+        let mut arp_bytes = vec![0; ARP_HEADER_LEN];
+        let arp_length = reply.write_to(&mut arp_bytes)?;
+        debug_assert_eq!(arp_length, arp_bytes.len());
+
+        let ethernet_reply = EthernetFrame {
+            destination_mac: reply.target_mac,
+            source_mac: self.mac_address,
+            ether_type: EtherType::Arp,
+            payload: &arp_bytes,
+        };
+        let mut output = vec![0; ETHERNET_HEADER_LEN + arp_length];
+        let ethernet_length = ethernet_reply.write_to(&mut output)?;
+        debug_assert_eq!(ethernet_length, output.len());
+
+        Ok(Some(output))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
+        arp::{ArpOperation, HardwareType, ProtocolType},
         icmp::{IcmpEchoMessage, IcmpMessage},
         ipv4::Ipv4Protocol,
     };
@@ -254,6 +354,41 @@ mod tests {
         )
     }
 
+    fn arp_frame(
+        destination_mac: MacAddress,
+        operation: ArpOperation,
+        target_ip: Ipv4Addr,
+    ) -> Vec<u8> {
+        let target_mac = match operation {
+            ArpOperation::Request => MacAddress::new([0; 6]),
+            ArpOperation::Reply | ArpOperation::Unknown(_) => LOCAL_MAC,
+        };
+        let packet = ArpPacket {
+            hardware_type: HardwareType::Ethernet,
+            protocol_type: ProtocolType::Ipv4,
+            hardware_size: 6,
+            protocol_size: 4,
+            operation,
+            sender_mac: REMOTE_MAC,
+            sender_ip: REMOTE_IP,
+            target_mac,
+            target_ip,
+            trailing_bytes: &[],
+        };
+        let mut arp_bytes = [0; ARP_HEADER_LEN];
+        packet.write_to(&mut arp_bytes).unwrap();
+
+        let frame = EthernetFrame {
+            destination_mac,
+            source_mac: REMOTE_MAC,
+            ether_type: EtherType::Arp,
+            payload: &arp_bytes,
+        };
+        let mut ethernet_bytes = vec![0; ETHERNET_HEADER_LEN + ARP_HEADER_LEN];
+        frame.write_to(&mut ethernet_bytes).unwrap();
+        ethernet_bytes
+    }
+
     #[test]
     fn replies_to_an_ethernet_ipv4_icmp_echo_request() {
         let mut interface = interface();
@@ -289,6 +424,90 @@ mod tests {
                 sequence_number: 7,
                 payload: &ECHO_PAYLOAD,
             })
+        );
+    }
+
+    #[test]
+    fn replies_to_a_broadcast_arp_request_for_its_ipv4_address() {
+        let now = Instant::now();
+        let input = arp_frame(MacAddress::BROADCAST, ArpOperation::Request, LOCAL_IP);
+        let mut interface = interface();
+
+        let output = interface.process_frame_at(&input, now).unwrap().unwrap();
+
+        let ethernet = parse_eth_frame(&output).unwrap();
+        assert_eq!(ethernet.destination_mac, REMOTE_MAC);
+        assert_eq!(ethernet.source_mac, LOCAL_MAC);
+        assert_eq!(ethernet.ether_type, EtherType::Arp);
+
+        let arp = ArpPacket::parse(ethernet.payload).unwrap();
+        assert_eq!(arp.operation, ArpOperation::Reply);
+        assert_eq!(arp.sender_mac, LOCAL_MAC);
+        assert_eq!(arp.sender_ip, LOCAL_IP);
+        assert_eq!(arp.target_mac, REMOTE_MAC);
+        assert_eq!(arp.target_ip, REMOTE_IP);
+        assert!(arp.trailing_bytes.is_empty());
+        assert_eq!(interface.cached_mac(REMOTE_IP, now), Some(REMOTE_MAC));
+    }
+
+    #[test]
+    fn learns_a_broadcast_arp_request_for_another_ipv4_address_without_replying() {
+        let now = Instant::now();
+        let input = arp_frame(MacAddress::BROADCAST, ArpOperation::Request, OTHER_IP);
+        let mut interface = interface();
+
+        assert_eq!(interface.process_frame_at(&input, now), Ok(None));
+        assert_eq!(interface.cached_mac(REMOTE_IP, now), Some(REMOTE_MAC));
+    }
+
+    #[test]
+    fn learns_an_arp_reply_addressed_to_its_mac_without_replying() {
+        let now = Instant::now();
+        let input = arp_frame(LOCAL_MAC, ArpOperation::Reply, LOCAL_IP);
+        let mut interface = interface();
+
+        assert_eq!(interface.process_frame_at(&input, now), Ok(None));
+        assert_eq!(interface.cached_mac(REMOTE_IP, now), Some(REMOTE_MAC));
+    }
+
+    #[test]
+    fn ignores_arp_frames_addressed_to_another_mac_without_learning_them() {
+        let now = Instant::now();
+        let input = arp_frame(OTHER_MAC, ArpOperation::Request, LOCAL_IP);
+        let mut interface = interface();
+
+        assert_eq!(interface.process_frame_at(&input, now), Ok(None));
+        assert_eq!(interface.cached_mac(REMOTE_IP, now), None);
+    }
+
+    #[test]
+    fn ignores_unknown_arp_operations_without_learning_them() {
+        let now = Instant::now();
+        let input = arp_frame(MacAddress::BROADCAST, ArpOperation::Unknown(99), LOCAL_IP);
+        let mut interface = interface();
+
+        assert_eq!(interface.process_frame_at(&input, now), Ok(None));
+        assert_eq!(interface.cached_mac(REMOTE_IP, now), None);
+    }
+
+    #[test]
+    fn reports_malformed_arp_packets() {
+        let payload = [0; ARP_HEADER_LEN - 1];
+        let frame = EthernetFrame {
+            destination_mac: MacAddress::BROADCAST,
+            source_mac: REMOTE_MAC,
+            ether_type: EtherType::Arp,
+            payload: &payload,
+        };
+        let mut input = vec![0; ETHERNET_HEADER_LEN + payload.len()];
+        frame.write_to(&mut input).unwrap();
+
+        assert_eq!(
+            interface().process_frame_at(&input, Instant::now()),
+            Err(InterfaceError::Arp(ArpParseError::PacketTooShort {
+                actual: ARP_HEADER_LEN - 1,
+                minimum: ARP_HEADER_LEN,
+            }))
         );
     }
 
