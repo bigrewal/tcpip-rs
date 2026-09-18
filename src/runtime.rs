@@ -74,10 +74,26 @@ pub fn run<D: EthernetDevice + ?Sized>(
     device: &mut D,
     interface: &mut NetworkInterface,
 ) -> io::Result<()> {
+    run_with_observer(device, interface, |_| {})
+}
+
+pub fn run_with_observer<D, F>(
+    device: &mut D,
+    interface: &mut NetworkInterface,
+    mut observer: F,
+) -> io::Result<()>
+where
+    D: EthernetDevice + ?Sized,
+    F: FnMut(RunOutcome),
+{
     let mut receive_buffer = vec![0; DEFAULT_RECEIVE_BUFFER_LEN];
 
     loop {
-        let _ = run_once(device, interface, &mut receive_buffer)?;
+        match run_once(device, interface, &mut receive_buffer) {
+            Ok(outcome) => observer(outcome),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
     }
 }
 
