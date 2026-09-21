@@ -5,6 +5,7 @@ pub mod icmp;
 pub mod interface;
 pub mod ipv4;
 pub mod runtime;
+pub mod udp;
 
 use std::fmt;
 
