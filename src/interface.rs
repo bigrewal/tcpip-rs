@@ -16,6 +16,10 @@ use crate::{
         parse_ipv4_packet,
     },
     parse_eth_frame,
+    udp::{
+        UDP_HEADER_LEN, UdpParseError, UdpSerialiseError, parse_udp_datagram,
+        serialise_udp_datagram, validate_udp_checksum,
+    },
 };
 
 pub const DEFAULT_IPV4_TTL: u8 = 64;
@@ -23,6 +27,7 @@ pub const DEFAULT_ARP_CACHE_CAPACITY: usize = 64;
 pub const DEFAULT_ARP_CACHE_TTL: Duration = Duration::from_secs(60);
 pub const DEFAULT_ARP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEFAULT_ARP_MAX_ATTEMPTS: usize = 3;
+pub const UDP_ECHO_PORT: u16 = 9000;
 
 #[derive(Debug)]
 pub struct NetworkInterface {
@@ -40,6 +45,8 @@ pub enum InterfaceError {
     Serialise(SerialiseError),
     Ipv4Serialise(Ipv4SerialiseError),
     Arp(ArpParseError),
+    Udp(UdpParseError),
+    UdpSerialise(UdpSerialiseError),
 }
 
 impl fmt::Display for InterfaceError {
@@ -53,6 +60,10 @@ impl fmt::Display for InterfaceError {
                 write!(formatter, "could not serialise IPv4 packet: {error}")
             }
             Self::Arp(error) => write!(formatter, "invalid ARP packet: {error}"),
+            Self::Udp(error) => write!(formatter, "invalid UDP datagram: {error}"),
+            Self::UdpSerialise(error) => {
+                write!(formatter, "could not serialise UDP datagram: {error}")
+            }
         }
     }
 }
@@ -66,6 +77,8 @@ impl std::error::Error for InterfaceError {
             Self::Serialise(error) => Some(error),
             Self::Ipv4Serialise(error) => Some(error),
             Self::Arp(error) => Some(error),
+            Self::Udp(error) => Some(error),
+            Self::UdpSerialise(error) => Some(error),
         }
     }
 }
@@ -103,6 +116,18 @@ impl From<Ipv4SerialiseError> for InterfaceError {
 impl From<ArpParseError> for InterfaceError {
     fn from(error: ArpParseError) -> Self {
         Self::Arp(error)
+    }
+}
+
+impl From<UdpParseError> for InterfaceError {
+    fn from(error: UdpParseError) -> Self {
+        Self::Udp(error)
+    }
+}
+
+impl From<UdpSerialiseError> for InterfaceError {
+    fn from(error: UdpSerialiseError) -> Self {
+        Self::UdpSerialise(error)
     }
 }
 
@@ -181,10 +206,18 @@ impl NetworkInterface {
         if ipv4.more_fragments || ipv4.fragment_offset != 0 {
             return Ok(None);
         }
-        if ipv4.protocol != Ipv4Protocol::Icmp {
-            return Ok(None);
+        match ipv4.protocol {
+            Ipv4Protocol::Icmp => self.process_icmp_packet(ethernet, &ipv4),
+            Ipv4Protocol::Udp => self.process_udp_datagram(ethernet, &ipv4),
+            Ipv4Protocol::Tcp | Ipv4Protocol::Unknown(_) => Ok(None),
         }
+    }
 
+    fn process_icmp_packet(
+        &mut self,
+        ethernet: &EthernetFrame<'_>,
+        ipv4: &Ipv4Packet<'_>,
+    ) -> Result<Option<Vec<u8>>, InterfaceError> {
         let icmp_request = parse_icmp_message(ipv4.payload)?;
         let Some(icmp_reply) = build_echo_reply(&icmp_request) else {
             return Ok(None);
@@ -194,23 +227,59 @@ impl NetworkInterface {
         let icmp_length = icmp_reply.write_to(&mut icmp_bytes)?;
         debug_assert_eq!(icmp_length, icmp_bytes.len());
 
+        self.build_ipv4_reply(ethernet, ipv4, Ipv4Protocol::Icmp, &icmp_bytes)
+    }
+
+    fn process_udp_datagram(
+        &mut self,
+        ethernet: &EthernetFrame<'_>,
+        ipv4: &Ipv4Packet<'_>,
+    ) -> Result<Option<Vec<u8>>, InterfaceError> {
+        validate_udp_checksum(ipv4.source, ipv4.destination, ipv4.payload)?;
+        let request = parse_udp_datagram(ipv4.payload)?;
+
+        if request.destination_port != UDP_ECHO_PORT || request.source_port == 0 {
+            return Ok(None);
+        }
+
+        let mut udp_bytes = vec![0; UDP_HEADER_LEN + request.payload.len()];
+        let udp_length = serialise_udp_datagram(
+            self.ipv4_address,
+            ipv4.source,
+            UDP_ECHO_PORT,
+            request.source_port,
+            request.payload,
+            &mut udp_bytes,
+        )?;
+        debug_assert_eq!(udp_length, udp_bytes.len());
+
+        self.build_ipv4_reply(ethernet, ipv4, Ipv4Protocol::Udp, &udp_bytes)
+    }
+
+    fn build_ipv4_reply(
+        &mut self,
+        ethernet: &EthernetFrame<'_>,
+        request: &Ipv4Packet<'_>,
+        protocol: Ipv4Protocol,
+        payload: &[u8],
+    ) -> Result<Option<Vec<u8>>, InterfaceError> {
         let identification = self.next_ipv4_identification;
         let ipv4_reply = Ipv4Packet {
-            dscp: ipv4.dscp,
-            ecn: ipv4.ecn,
+            dscp: request.dscp,
+            ecn: request.ecn,
             identification,
             ttl: DEFAULT_IPV4_TTL,
-            protocol: Ipv4Protocol::Icmp,
+            protocol,
             dont_fragment: false,
             more_fragments: false,
             fragment_offset: 0,
             source: self.ipv4_address,
-            destination: ipv4.source,
+            destination: request.source,
             options: &[],
-            payload: &icmp_bytes,
+            payload,
             trailing_bytes: &[],
         };
-        let mut ipv4_bytes = vec![0; IPV4_MIN_HEADER_LEN + icmp_length];
+        let mut ipv4_bytes = vec![0; IPV4_MIN_HEADER_LEN + payload.len()];
         let ipv4_length = ipv4_reply.write_to(&mut ipv4_bytes)?;
         debug_assert_eq!(ipv4_length, ipv4_bytes.len());
 
@@ -266,6 +335,7 @@ mod tests {
         arp::{ArpOperation, HardwareType, ProtocolType},
         icmp::{IcmpEchoMessage, IcmpMessage},
         ipv4::Ipv4Protocol,
+        udp::{parse_udp_datagram, serialise_udp_datagram, validate_udp_checksum},
     };
 
     const LOCAL_MAC: MacAddress = MacAddress::new([0x02, 0, 0, 0, 0, 1]);
@@ -354,6 +424,20 @@ mod tests {
         )
     }
 
+    fn udp_frame(source_port: u16, destination_port: u16, payload: &[u8]) -> Vec<u8> {
+        let mut udp_bytes = vec![0; UDP_HEADER_LEN + payload.len()];
+        serialise_udp_datagram(
+            REMOTE_IP,
+            LOCAL_IP,
+            source_port,
+            destination_port,
+            payload,
+            &mut udp_bytes,
+        )
+        .unwrap();
+        ipv4_frame(LOCAL_MAC, LOCAL_IP, Ipv4Protocol::Udp, &udp_bytes, false, 0)
+    }
+
     fn arp_frame(
         destination_mac: MacAddress,
         operation: ArpOperation,
@@ -425,6 +509,39 @@ mod tests {
                 payload: &ECHO_PAYLOAD,
             })
         );
+    }
+
+    #[test]
+    fn replies_to_a_udp_echo_request() {
+        let input = udp_frame(49152, UDP_ECHO_PORT, b"hello UDP");
+
+        let output = interface().process_frame(&input).unwrap().unwrap();
+
+        let ethernet = parse_eth_frame(&output).unwrap();
+        assert_eq!(ethernet.destination_mac, REMOTE_MAC);
+        assert_eq!(ethernet.source_mac, LOCAL_MAC);
+        assert_eq!(ethernet.ether_type, EtherType::Ipv4);
+
+        let ipv4 = parse_ipv4_packet(ethernet.payload).unwrap();
+        assert_eq!(ipv4.source, LOCAL_IP);
+        assert_eq!(ipv4.destination, REMOTE_IP);
+        assert_eq!(ipv4.protocol, Ipv4Protocol::Udp);
+        assert_eq!(ipv4.ttl, DEFAULT_IPV4_TTL);
+        assert_eq!(ipv4.identification, 0);
+        assert_eq!(ipv4.dscp, 10);
+        assert_eq!(ipv4.ecn, 2);
+        assert!(ipv4.options.is_empty());
+        assert!(ipv4.trailing_bytes.is_empty());
+
+        assert_eq!(
+            validate_udp_checksum(ipv4.source, ipv4.destination, ipv4.payload),
+            Ok(())
+        );
+        let udp = parse_udp_datagram(ipv4.payload).unwrap();
+        assert_eq!(udp.source_port, UDP_ECHO_PORT);
+        assert_eq!(udp.destination_port, 49152);
+        assert_eq!(udp.payload, b"hello UDP");
+        assert_ne!(udp.checksum, 0);
     }
 
     #[test]
@@ -570,15 +687,29 @@ mod tests {
     }
 
     #[test]
-    fn ignores_non_icmp_ipv4_packets() {
+    fn ignores_unsupported_ipv4_protocols() {
         let input = ipv4_frame(
             LOCAL_MAC,
             LOCAL_IP,
-            Ipv4Protocol::Udp,
+            Ipv4Protocol::Tcp,
             &[0xde, 0xad],
             false,
             0,
         );
+
+        assert_eq!(interface().process_frame(&input), Ok(None));
+    }
+
+    #[test]
+    fn ignores_udp_datagrams_for_an_unbound_port() {
+        let input = udp_frame(49152, UDP_ECHO_PORT + 1, b"hello UDP");
+
+        assert_eq!(interface().process_frame(&input), Ok(None));
+    }
+
+    #[test]
+    fn ignores_udp_datagrams_without_a_reply_port() {
+        let input = udp_frame(0, UDP_ECHO_PORT, b"hello UDP");
 
         assert_eq!(interface().process_frame(&input), Ok(None));
     }
@@ -673,6 +804,47 @@ mod tests {
         assert_eq!(
             interface().process_frame(&input),
             Err(InterfaceError::Icmp(IcmpParseError::InvalidChecksum))
+        );
+    }
+
+    #[test]
+    fn reports_malformed_udp_datagrams() {
+        let input = ipv4_frame(
+            LOCAL_MAC,
+            LOCAL_IP,
+            Ipv4Protocol::Udp,
+            &[0; UDP_HEADER_LEN - 1],
+            false,
+            0,
+        );
+
+        assert_eq!(
+            interface().process_frame(&input),
+            Err(InterfaceError::Udp(UdpParseError::DatagramTooShort {
+                actual: UDP_HEADER_LEN - 1,
+                minimum: UDP_HEADER_LEN,
+            }))
+        );
+    }
+
+    #[test]
+    fn reports_a_udp_checksum_failure() {
+        let mut udp_bytes = vec![0; UDP_HEADER_LEN + 4];
+        serialise_udp_datagram(
+            REMOTE_IP,
+            LOCAL_IP,
+            49152,
+            UDP_ECHO_PORT,
+            b"ping",
+            &mut udp_bytes,
+        )
+        .unwrap();
+        udp_bytes[UDP_HEADER_LEN] ^= 1;
+        let input = ipv4_frame(LOCAL_MAC, LOCAL_IP, Ipv4Protocol::Udp, &udp_bytes, false, 0);
+
+        assert_eq!(
+            interface().process_frame(&input),
+            Err(InterfaceError::Udp(UdpParseError::InvalidChecksum))
         );
     }
 

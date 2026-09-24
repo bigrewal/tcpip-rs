@@ -26,6 +26,7 @@ fn main() -> anyhow::Result<()> {
     eprintln!("  sudo ip address add 10.0.0.1/24 dev {}", device.name());
     eprintln!("  sudo ip link set {} up", device.name());
     eprintln!("  ping {STACK_IP}");
+    eprintln!("  printf 'hello UDP\\n' | nc -u -w 1 {STACK_IP} 9000");
 
     run_with_observer(&mut device, &mut interface, |outcome| match outcome {
         RunOutcome::MalformedFrame { error, .. } => eprintln!("dropped malformed frame: {error}"),
@@ -42,5 +43,5 @@ fn main() -> anyhow::Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn main() {
     eprintln!("tcp-ip's TAP executable currently requires Linux");
-    eprintln!("run it inside a Linux VM to exercise Ethernet and ARP end to end");
+    eprintln!("run it inside a Linux VM to exercise the network stack end to end");
 }

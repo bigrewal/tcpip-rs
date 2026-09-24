@@ -107,8 +107,10 @@ mod tests {
         EtherType, EthernetFrame, MacAddress,
         arp::{ARP_HEADER_LEN, ArpOperation, ArpPacket, build_request},
         icmp::{ICMP_ECHO_HEADER_LEN, IcmpEchoMessage, IcmpMessage, parse_icmp_message},
+        interface::UDP_ECHO_PORT,
         ipv4::{IPV4_MIN_HEADER_LEN, Ipv4Packet, Ipv4Protocol, parse_ipv4_packet},
         parse_eth_frame,
+        udp::{UDP_HEADER_LEN, parse_udp_datagram, serialise_udp_datagram, validate_udp_checksum},
     };
 
     const LOCAL_MAC: MacAddress = MacAddress::new([0x02, 0, 0, 0, 0, 1]);
@@ -225,6 +227,38 @@ mod tests {
         wrap_ethernet(EtherType::Ipv4, &ipv4_bytes)
     }
 
+    fn udp_echo_request_frame() -> Vec<u8> {
+        let mut udp_bytes = [0; UDP_HEADER_LEN + 9];
+        serialise_udp_datagram(
+            REMOTE_IP,
+            LOCAL_IP,
+            49152,
+            UDP_ECHO_PORT,
+            b"hello UDP",
+            &mut udp_bytes,
+        )
+        .unwrap();
+
+        let ipv4 = Ipv4Packet {
+            dscp: 0,
+            ecn: 0,
+            identification: 0xabcd,
+            ttl: 64,
+            protocol: Ipv4Protocol::Udp,
+            dont_fragment: false,
+            more_fragments: false,
+            fragment_offset: 0,
+            source: REMOTE_IP,
+            destination: LOCAL_IP,
+            options: &[],
+            payload: &udp_bytes,
+            trailing_bytes: &[],
+        };
+        let mut ipv4_bytes = vec![0; IPV4_MIN_HEADER_LEN + udp_bytes.len()];
+        ipv4.write_to(&mut ipv4_bytes).unwrap();
+        wrap_ethernet(EtherType::Ipv4, &ipv4_bytes)
+    }
+
     #[test]
     fn receives_an_arp_request_and_transmits_its_reply() {
         let request = arp_request_frame();
@@ -284,6 +318,43 @@ mod tests {
         let ipv4 = parse_ipv4_packet(ethernet.payload).unwrap();
         let reply = parse_icmp_message(ipv4.payload).unwrap();
         assert!(matches!(reply, IcmpMessage::EchoReply(_)));
+    }
+
+    #[test]
+    fn receives_a_udp_echo_request_and_transmits_its_reply() {
+        let request = udp_echo_request_frame();
+        let mut device = MemoryDevice::with_frame(request.clone());
+        let mut interface = interface();
+        let mut receive_buffer = [0; 128];
+
+        let outcome = run_once_at(
+            &mut device,
+            &mut interface,
+            &mut receive_buffer,
+            Instant::now(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            RunOutcome::ReplyTransmitted {
+                received: request.len(),
+                transmitted: request.len(),
+            }
+        );
+        assert_eq!(device.transmitted_frames.len(), 1);
+
+        let ethernet = parse_eth_frame(&device.transmitted_frames[0]).unwrap();
+        let ipv4 = parse_ipv4_packet(ethernet.payload).unwrap();
+        assert_eq!(ipv4.protocol, Ipv4Protocol::Udp);
+        assert_eq!(
+            validate_udp_checksum(ipv4.source, ipv4.destination, ipv4.payload),
+            Ok(())
+        );
+        let udp = parse_udp_datagram(ipv4.payload).unwrap();
+        assert_eq!(udp.source_port, UDP_ECHO_PORT);
+        assert_eq!(udp.destination_port, 49152);
+        assert_eq!(udp.payload, b"hello UDP");
     }
 
     #[test]
