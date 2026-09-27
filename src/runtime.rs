@@ -107,9 +107,13 @@ mod tests {
         EtherType, EthernetFrame, MacAddress,
         arp::{ARP_HEADER_LEN, ArpOperation, ArpPacket, build_request},
         icmp::{ICMP_ECHO_HEADER_LEN, IcmpEchoMessage, IcmpMessage, parse_icmp_message},
-        interface::UDP_ECHO_PORT,
+        interface::{DEFAULT_TCP_INITIAL_SEQUENCE, TCP_ECHO_PORT, UDP_ECHO_PORT},
         ipv4::{IPV4_MIN_HEADER_LEN, Ipv4Packet, Ipv4Protocol, parse_ipv4_packet},
         parse_eth_frame,
+        tcp::{
+            TCP_MIN_HEADER_LEN, TcpFlags, TcpSegmentToSend, parse_tcp_segment,
+            validate_tcp_checksum,
+        },
         udp::{UDP_HEADER_LEN, parse_udp_datagram, serialise_udp_datagram, validate_udp_checksum},
     };
 
@@ -259,6 +263,41 @@ mod tests {
         wrap_ethernet(EtherType::Ipv4, &ipv4_bytes)
     }
 
+    fn tcp_syn_frame() -> Vec<u8> {
+        let syn = TcpSegmentToSend {
+            source_port: 49_152,
+            destination_port: TCP_ECHO_PORT,
+            sequence_number: 0xaabb_ccdd,
+            acknowledgement_number: 0,
+            flags: TcpFlags::SYN,
+            window_size: 32_768,
+            urgent_pointer: 0,
+            options: &[],
+            payload: &[],
+        };
+        let mut tcp_bytes = [0; TCP_MIN_HEADER_LEN];
+        syn.write_to(REMOTE_IP, LOCAL_IP, &mut tcp_bytes).unwrap();
+
+        let ipv4 = Ipv4Packet {
+            dscp: 0,
+            ecn: 0,
+            identification: 0xabcd,
+            ttl: 64,
+            protocol: Ipv4Protocol::Tcp,
+            dont_fragment: false,
+            more_fragments: false,
+            fragment_offset: 0,
+            source: REMOTE_IP,
+            destination: LOCAL_IP,
+            options: &[],
+            payload: &tcp_bytes,
+            trailing_bytes: &[],
+        };
+        let mut ipv4_bytes = vec![0; IPV4_MIN_HEADER_LEN + tcp_bytes.len()];
+        ipv4.write_to(&mut ipv4_bytes).unwrap();
+        wrap_ethernet(EtherType::Ipv4, &ipv4_bytes)
+    }
+
     #[test]
     fn receives_an_arp_request_and_transmits_its_reply() {
         let request = arp_request_frame();
@@ -355,6 +394,49 @@ mod tests {
         assert_eq!(udp.source_port, UDP_ECHO_PORT);
         assert_eq!(udp.destination_port, 49152);
         assert_eq!(udp.payload, b"hello UDP");
+    }
+
+    #[test]
+    fn receives_a_tcp_syn_and_transmits_a_syn_ack() {
+        let request = tcp_syn_frame();
+        let mut device = MemoryDevice::with_frame(request.clone());
+        let mut interface = interface();
+        let mut receive_buffer = [0; 128];
+
+        let outcome = run_once_at(
+            &mut device,
+            &mut interface,
+            &mut receive_buffer,
+            Instant::now(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            RunOutcome::ReplyTransmitted {
+                received: request.len(),
+                transmitted: request.len(),
+            }
+        );
+        assert_eq!(device.transmitted_frames.len(), 1);
+
+        let ethernet = parse_eth_frame(&device.transmitted_frames[0]).unwrap();
+        let ipv4 = parse_ipv4_packet(ethernet.payload).unwrap();
+        assert_eq!(ipv4.protocol, Ipv4Protocol::Tcp);
+        assert_eq!(ipv4.source, LOCAL_IP);
+        assert_eq!(ipv4.destination, REMOTE_IP);
+        assert_eq!(
+            validate_tcp_checksum(ipv4.source, ipv4.destination, ipv4.payload),
+            Ok(())
+        );
+
+        let tcp = parse_tcp_segment(ipv4.payload).unwrap();
+        assert_eq!(tcp.source_port, TCP_ECHO_PORT);
+        assert_eq!(tcp.destination_port, 49_152);
+        assert_eq!(tcp.sequence_number, DEFAULT_TCP_INITIAL_SEQUENCE);
+        assert_eq!(tcp.acknowledgement_number, 0xaabb_ccde);
+        assert_eq!(tcp.flags, TcpFlags::SYN | TcpFlags::ACK);
+        assert!(tcp.payload.is_empty());
     }
 
     #[test]

@@ -16,6 +16,11 @@ use crate::{
         parse_ipv4_packet,
     },
     parse_eth_frame,
+    tcp::{
+        TCP_MIN_HEADER_LEN, TcpParseError, TcpSegmentToSend, TcpSerialiseError,
+        listener::{TcpConnection, TcpConnectionKey, TcpListener},
+        parse_tcp_segment, validate_tcp_checksum,
+    },
     udp::{
         UDP_HEADER_LEN, UdpParseError, UdpSerialiseError, parse_udp_datagram,
         serialise_udp_datagram, validate_udp_checksum,
@@ -28,6 +33,10 @@ pub const DEFAULT_ARP_CACHE_TTL: Duration = Duration::from_secs(60);
 pub const DEFAULT_ARP_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEFAULT_ARP_MAX_ATTEMPTS: usize = 3;
 pub const UDP_ECHO_PORT: u16 = 9000;
+pub const TCP_ECHO_PORT: u16 = 9000;
+pub const DEFAULT_TCP_CONNECTION_CAPACITY: usize = 64;
+/// Fixed only while this educational stack builds out the handshake machinery.
+pub const DEFAULT_TCP_INITIAL_SEQUENCE: u32 = 0x1234_5678;
 
 #[derive(Debug)]
 pub struct NetworkInterface {
@@ -35,6 +44,7 @@ pub struct NetworkInterface {
     pub ipv4_address: Ipv4Addr,
     pub next_ipv4_identification: u16,
     arp_resolver: ArpResolver,
+    tcp_listener: TcpListener,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +57,8 @@ pub enum InterfaceError {
     Arp(ArpParseError),
     Udp(UdpParseError),
     UdpSerialise(UdpSerialiseError),
+    Tcp(TcpParseError),
+    TcpSerialise(TcpSerialiseError),
 }
 
 impl fmt::Display for InterfaceError {
@@ -64,6 +76,10 @@ impl fmt::Display for InterfaceError {
             Self::UdpSerialise(error) => {
                 write!(formatter, "could not serialise UDP datagram: {error}")
             }
+            Self::Tcp(error) => write!(formatter, "invalid TCP segment: {error}"),
+            Self::TcpSerialise(error) => {
+                write!(formatter, "could not serialise TCP segment: {error}")
+            }
         }
     }
 }
@@ -79,6 +95,8 @@ impl std::error::Error for InterfaceError {
             Self::Arp(error) => Some(error),
             Self::Udp(error) => Some(error),
             Self::UdpSerialise(error) => Some(error),
+            Self::Tcp(error) => Some(error),
+            Self::TcpSerialise(error) => Some(error),
         }
     }
 }
@@ -131,6 +149,18 @@ impl From<UdpSerialiseError> for InterfaceError {
     }
 }
 
+impl From<TcpParseError> for InterfaceError {
+    fn from(error: TcpParseError) -> Self {
+        Self::Tcp(error)
+    }
+}
+
+impl From<TcpSerialiseError> for InterfaceError {
+    fn from(error: TcpSerialiseError) -> Self {
+        Self::TcpSerialise(error)
+    }
+}
+
 impl NetworkInterface {
     pub fn new(mac_address: MacAddress, ipv4_address: Ipv4Addr) -> Self {
         Self::with_arp_config(
@@ -161,6 +191,12 @@ impl NetworkInterface {
                 ArpCache::new(cache_capacity, cache_ttl),
                 retry_interval,
                 max_attempts,
+            ),
+            tcp_listener: TcpListener::new(
+                ipv4_address,
+                TCP_ECHO_PORT,
+                DEFAULT_TCP_CONNECTION_CAPACITY,
+                DEFAULT_TCP_INITIAL_SEQUENCE,
             ),
         }
     }
@@ -194,6 +230,10 @@ impl NetworkInterface {
         self.arp_resolver.cached_mac(ip, now)
     }
 
+    pub fn tcp_connection(&self, key: TcpConnectionKey) -> Option<&TcpConnection> {
+        self.tcp_listener.connection(key)
+    }
+
     fn process_ipv4_frame(
         &mut self,
         ethernet: &EthernetFrame<'_>,
@@ -209,7 +249,8 @@ impl NetworkInterface {
         match ipv4.protocol {
             Ipv4Protocol::Icmp => self.process_icmp_packet(ethernet, &ipv4),
             Ipv4Protocol::Udp => self.process_udp_datagram(ethernet, &ipv4),
-            Ipv4Protocol::Tcp | Ipv4Protocol::Unknown(_) => Ok(None),
+            Ipv4Protocol::Tcp => self.process_tcp_segment(ethernet, &ipv4),
+            Ipv4Protocol::Unknown(_) => Ok(None),
         }
     }
 
@@ -254,6 +295,35 @@ impl NetworkInterface {
         debug_assert_eq!(udp_length, udp_bytes.len());
 
         self.build_ipv4_reply(ethernet, ipv4, Ipv4Protocol::Udp, &udp_bytes)
+    }
+
+    fn process_tcp_segment(
+        &mut self,
+        ethernet: &EthernetFrame<'_>,
+        ipv4: &Ipv4Packet<'_>,
+    ) -> Result<Option<Vec<u8>>, InterfaceError> {
+        validate_tcp_checksum(ipv4.source, ipv4.destination, ipv4.payload)?;
+        let request = parse_tcp_segment(ipv4.payload)?;
+        let Some(syn_ack) = self.tcp_listener.receive_syn(ipv4.source, &request) else {
+            return Ok(None);
+        };
+
+        let reply = TcpSegmentToSend {
+            source_port: syn_ack.source_port,
+            destination_port: syn_ack.destination_port,
+            sequence_number: syn_ack.sequence_number,
+            acknowledgement_number: syn_ack.acknowledgement_number,
+            flags: crate::tcp::TcpFlags::SYN | crate::tcp::TcpFlags::ACK,
+            window_size: syn_ack.window_size,
+            urgent_pointer: 0,
+            options: &[],
+            payload: &[],
+        };
+        let mut tcp_bytes = vec![0; TCP_MIN_HEADER_LEN];
+        let tcp_length = reply.write_to(self.ipv4_address, ipv4.source, &mut tcp_bytes)?;
+        debug_assert_eq!(tcp_length, tcp_bytes.len());
+
+        self.build_ipv4_reply(ethernet, ipv4, Ipv4Protocol::Tcp, &tcp_bytes)
     }
 
     fn build_ipv4_reply(
@@ -335,6 +405,11 @@ mod tests {
         arp::{ArpOperation, HardwareType, ProtocolType},
         icmp::{IcmpEchoMessage, IcmpMessage},
         ipv4::Ipv4Protocol,
+        tcp::{
+            TcpFlags, TcpSegmentToSend,
+            listener::{TcpConnectionKey, TcpConnectionState},
+            parse_tcp_segment, validate_tcp_checksum,
+        },
         udp::{parse_udp_datagram, serialise_udp_datagram, validate_udp_checksum},
     };
 
@@ -436,6 +511,31 @@ mod tests {
         )
         .unwrap();
         ipv4_frame(LOCAL_MAC, LOCAL_IP, Ipv4Protocol::Udp, &udp_bytes, false, 0)
+    }
+
+    fn tcp_frame(
+        source_port: u16,
+        destination_port: u16,
+        sequence_number: u32,
+        flags: TcpFlags,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let segment = TcpSegmentToSend {
+            source_port,
+            destination_port,
+            sequence_number,
+            acknowledgement_number: 0,
+            flags,
+            window_size: 32_768,
+            urgent_pointer: 0,
+            options: &[],
+            payload,
+        };
+        let mut tcp_bytes = vec![0; TCP_MIN_HEADER_LEN + payload.len()];
+        segment
+            .write_to(REMOTE_IP, LOCAL_IP, &mut tcp_bytes)
+            .unwrap();
+        ipv4_frame(LOCAL_MAC, LOCAL_IP, Ipv4Protocol::Tcp, &tcp_bytes, false, 0)
     }
 
     fn arp_frame(
@@ -542,6 +642,62 @@ mod tests {
         assert_eq!(udp.destination_port, 49152);
         assert_eq!(udp.payload, b"hello UDP");
         assert_ne!(udp.checksum, 0);
+    }
+
+    #[test]
+    fn replies_to_a_tcp_syn_with_a_syn_ack_and_remembers_the_connection() {
+        const REMOTE_PORT: u16 = 49_152;
+        const REMOTE_SEQUENCE: u32 = 0xaabb_ccdd;
+        let input = tcp_frame(
+            REMOTE_PORT,
+            TCP_ECHO_PORT,
+            REMOTE_SEQUENCE,
+            TcpFlags::SYN,
+            &[],
+        );
+        let mut interface = interface();
+
+        let output = interface.process_frame(&input).unwrap().unwrap();
+
+        let ethernet = parse_eth_frame(&output).unwrap();
+        assert_eq!(ethernet.destination_mac, REMOTE_MAC);
+        assert_eq!(ethernet.source_mac, LOCAL_MAC);
+
+        let ipv4 = parse_ipv4_packet(ethernet.payload).unwrap();
+        assert_eq!(ipv4.source, LOCAL_IP);
+        assert_eq!(ipv4.destination, REMOTE_IP);
+        assert_eq!(ipv4.protocol, Ipv4Protocol::Tcp);
+        assert_eq!(ipv4.ttl, DEFAULT_IPV4_TTL);
+        assert_eq!(ipv4.identification, 0);
+        assert_eq!(
+            validate_tcp_checksum(ipv4.source, ipv4.destination, ipv4.payload),
+            Ok(())
+        );
+
+        let syn_ack = parse_tcp_segment(ipv4.payload).unwrap();
+        assert_eq!(syn_ack.source_port, TCP_ECHO_PORT);
+        assert_eq!(syn_ack.destination_port, REMOTE_PORT);
+        assert_eq!(syn_ack.sequence_number, DEFAULT_TCP_INITIAL_SEQUENCE);
+        assert_eq!(syn_ack.acknowledgement_number, REMOTE_SEQUENCE + 1);
+        assert_eq!(syn_ack.flags, TcpFlags::SYN | TcpFlags::ACK);
+        assert!(syn_ack.payload.is_empty());
+
+        let key = TcpConnectionKey {
+            local_ip: LOCAL_IP,
+            local_port: TCP_ECHO_PORT,
+            remote_ip: REMOTE_IP,
+            remote_port: REMOTE_PORT,
+        };
+        let connection = interface.tcp_connection(key).unwrap();
+        assert_eq!(connection.state, TcpConnectionState::SynReceived);
+        assert_eq!(
+            connection.initial_send_sequence,
+            DEFAULT_TCP_INITIAL_SEQUENCE
+        );
+        assert_eq!(connection.send_unacknowledged, DEFAULT_TCP_INITIAL_SEQUENCE);
+        assert_eq!(connection.send_next, DEFAULT_TCP_INITIAL_SEQUENCE + 1);
+        assert_eq!(connection.initial_receive_sequence, REMOTE_SEQUENCE);
+        assert_eq!(connection.receive_next, REMOTE_SEQUENCE + 1);
     }
 
     #[test]
@@ -691,11 +847,18 @@ mod tests {
         let input = ipv4_frame(
             LOCAL_MAC,
             LOCAL_IP,
-            Ipv4Protocol::Tcp,
+            Ipv4Protocol::Unknown(253),
             &[0xde, 0xad],
             false,
             0,
         );
+
+        assert_eq!(interface().process_frame(&input), Ok(None));
+    }
+
+    #[test]
+    fn ignores_tcp_syns_for_an_unbound_port() {
+        let input = tcp_frame(49_152, TCP_ECHO_PORT + 1, 100, TcpFlags::SYN, &[]);
 
         assert_eq!(interface().process_frame(&input), Ok(None));
     }
@@ -845,6 +1008,38 @@ mod tests {
         assert_eq!(
             interface().process_frame(&input),
             Err(InterfaceError::Udp(UdpParseError::InvalidChecksum))
+        );
+    }
+
+    #[test]
+    fn reports_malformed_tcp_segments() {
+        let input = ipv4_frame(
+            LOCAL_MAC,
+            LOCAL_IP,
+            Ipv4Protocol::Tcp,
+            &[0; TCP_MIN_HEADER_LEN - 1],
+            false,
+            0,
+        );
+
+        assert_eq!(
+            interface().process_frame(&input),
+            Err(InterfaceError::Tcp(TcpParseError::SegmentTooShort {
+                actual: TCP_MIN_HEADER_LEN - 1,
+                minimum: TCP_MIN_HEADER_LEN,
+            }))
+        );
+    }
+
+    #[test]
+    fn reports_a_tcp_checksum_failure() {
+        let mut input = tcp_frame(49_152, TCP_ECHO_PORT, 100, TcpFlags::SYN, &[]);
+        let checksum_index = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + 16;
+        input[checksum_index] ^= 1;
+
+        assert_eq!(
+            interface().process_frame(&input),
+            Err(InterfaceError::Tcp(TcpParseError::InvalidChecksum))
         );
     }
 
