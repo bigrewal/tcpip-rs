@@ -111,8 +111,9 @@ mod tests {
         ipv4::{IPV4_MIN_HEADER_LEN, Ipv4Packet, Ipv4Protocol, parse_ipv4_packet},
         parse_eth_frame,
         tcp::{
-            TCP_MIN_HEADER_LEN, TcpFlags, TcpSegmentToSend, parse_tcp_segment,
-            validate_tcp_checksum,
+            TCP_MIN_HEADER_LEN, TcpFlags, TcpSegmentToSend,
+            listener::{TcpConnectionKey, TcpConnectionState},
+            parse_tcp_segment, validate_tcp_checksum,
         },
         udp::{UDP_HEADER_LEN, parse_udp_datagram, serialise_udp_datagram, validate_udp_checksum},
     };
@@ -121,6 +122,8 @@ mod tests {
     const REMOTE_MAC: MacAddress = MacAddress::new([0x02, 0, 0, 0, 0, 2]);
     const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
     const REMOTE_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
+    const REMOTE_TCP_PORT: u16 = 49_152;
+    const REMOTE_TCP_SEQUENCE: u32 = 0xaabb_ccdd;
 
     #[derive(Debug, Default)]
     struct MemoryDevice {
@@ -263,20 +266,22 @@ mod tests {
         wrap_ethernet(EtherType::Ipv4, &ipv4_bytes)
     }
 
-    fn tcp_syn_frame() -> Vec<u8> {
-        let syn = TcpSegmentToSend {
-            source_port: 49_152,
+    fn tcp_frame(sequence_number: u32, acknowledgement_number: u32, flags: TcpFlags) -> Vec<u8> {
+        let segment = TcpSegmentToSend {
+            source_port: REMOTE_TCP_PORT,
             destination_port: TCP_ECHO_PORT,
-            sequence_number: 0xaabb_ccdd,
-            acknowledgement_number: 0,
-            flags: TcpFlags::SYN,
+            sequence_number,
+            acknowledgement_number,
+            flags,
             window_size: 32_768,
             urgent_pointer: 0,
             options: &[],
             payload: &[],
         };
         let mut tcp_bytes = [0; TCP_MIN_HEADER_LEN];
-        syn.write_to(REMOTE_IP, LOCAL_IP, &mut tcp_bytes).unwrap();
+        segment
+            .write_to(REMOTE_IP, LOCAL_IP, &mut tcp_bytes)
+            .unwrap();
 
         let ipv4 = Ipv4Packet {
             dscp: 0,
@@ -398,7 +403,7 @@ mod tests {
 
     #[test]
     fn receives_a_tcp_syn_and_transmits_a_syn_ack() {
-        let request = tcp_syn_frame();
+        let request = tcp_frame(REMOTE_TCP_SEQUENCE, 0, TcpFlags::SYN);
         let mut device = MemoryDevice::with_frame(request.clone());
         let mut interface = interface();
         let mut receive_buffer = [0; 128];
@@ -432,11 +437,69 @@ mod tests {
 
         let tcp = parse_tcp_segment(ipv4.payload).unwrap();
         assert_eq!(tcp.source_port, TCP_ECHO_PORT);
-        assert_eq!(tcp.destination_port, 49_152);
+        assert_eq!(tcp.destination_port, REMOTE_TCP_PORT);
         assert_eq!(tcp.sequence_number, DEFAULT_TCP_INITIAL_SEQUENCE);
-        assert_eq!(tcp.acknowledgement_number, 0xaabb_ccde);
+        assert_eq!(tcp.acknowledgement_number, REMOTE_TCP_SEQUENCE + 1);
         assert_eq!(tcp.flags, TcpFlags::SYN | TcpFlags::ACK);
         assert!(tcp.payload.is_empty());
+    }
+
+    #[test]
+    fn completes_a_tcp_handshake_without_replying_to_the_final_ack() {
+        let syn = tcp_frame(REMOTE_TCP_SEQUENCE, 0, TcpFlags::SYN);
+        let acknowledgement = tcp_frame(
+            REMOTE_TCP_SEQUENCE + 1,
+            DEFAULT_TCP_INITIAL_SEQUENCE + 1,
+            TcpFlags::ACK,
+        );
+        let mut device = MemoryDevice {
+            received_frames: VecDeque::from([Ok(syn.clone()), Ok(acknowledgement.clone())]),
+            transmitted_frames: Vec::new(),
+            transmit_error: None,
+        };
+        let mut interface = interface();
+        let mut receive_buffer = [0; 128];
+
+        let first = run_once_at(
+            &mut device,
+            &mut interface,
+            &mut receive_buffer,
+            Instant::now(),
+        )
+        .unwrap();
+        let second = run_once_at(
+            &mut device,
+            &mut interface,
+            &mut receive_buffer,
+            Instant::now(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            first,
+            RunOutcome::ReplyTransmitted {
+                received: syn.len(),
+                transmitted: syn.len(),
+            }
+        );
+        assert_eq!(
+            second,
+            RunOutcome::Ignored {
+                received: acknowledgement.len(),
+            }
+        );
+        assert_eq!(device.transmitted_frames.len(), 1);
+
+        let key = TcpConnectionKey {
+            local_ip: LOCAL_IP,
+            local_port: TCP_ECHO_PORT,
+            remote_ip: REMOTE_IP,
+            remote_port: REMOTE_TCP_PORT,
+        };
+        assert_eq!(
+            interface.tcp_connection(key).unwrap().state,
+            TcpConnectionState::Established
+        );
     }
 
     #[test]

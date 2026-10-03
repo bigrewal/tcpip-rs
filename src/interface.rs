@@ -18,7 +18,7 @@ use crate::{
     parse_eth_frame,
     tcp::{
         TCP_MIN_HEADER_LEN, TcpParseError, TcpSegmentToSend, TcpSerialiseError,
-        listener::{TcpConnection, TcpConnectionKey, TcpListener},
+        listener::{TcpAction, TcpConnection, TcpConnectionKey, TcpListener},
         parse_tcp_segment, validate_tcp_checksum,
     },
     udp::{
@@ -304,8 +304,9 @@ impl NetworkInterface {
     ) -> Result<Option<Vec<u8>>, InterfaceError> {
         validate_tcp_checksum(ipv4.source, ipv4.destination, ipv4.payload)?;
         let request = parse_tcp_segment(ipv4.payload)?;
-        let Some(syn_ack) = self.tcp_listener.receive_syn(ipv4.source, &request) else {
-            return Ok(None);
+        let syn_ack = match self.tcp_listener.receive_segment(ipv4.source, &request) {
+            TcpAction::SendSynAck(syn_ack) => syn_ack,
+            TcpAction::NoReply => return Ok(None),
         };
 
         let reply = TcpSegmentToSend {
@@ -517,6 +518,7 @@ mod tests {
         source_port: u16,
         destination_port: u16,
         sequence_number: u32,
+        acknowledgement_number: u32,
         flags: TcpFlags,
         payload: &[u8],
     ) -> Vec<u8> {
@@ -524,7 +526,7 @@ mod tests {
             source_port,
             destination_port,
             sequence_number,
-            acknowledgement_number: 0,
+            acknowledgement_number,
             flags,
             window_size: 32_768,
             urgent_pointer: 0,
@@ -652,6 +654,7 @@ mod tests {
             REMOTE_PORT,
             TCP_ECHO_PORT,
             REMOTE_SEQUENCE,
+            0,
             TcpFlags::SYN,
             &[],
         );
@@ -698,6 +701,46 @@ mod tests {
         assert_eq!(connection.send_next, DEFAULT_TCP_INITIAL_SEQUENCE + 1);
         assert_eq!(connection.initial_receive_sequence, REMOTE_SEQUENCE);
         assert_eq!(connection.receive_next, REMOTE_SEQUENCE + 1);
+    }
+
+    #[test]
+    fn final_tcp_ack_establishes_the_connection_without_sending_a_reply() {
+        const REMOTE_PORT: u16 = 49_152;
+        const REMOTE_SEQUENCE: u32 = 0xaabb_ccdd;
+        let syn = tcp_frame(
+            REMOTE_PORT,
+            TCP_ECHO_PORT,
+            REMOTE_SEQUENCE,
+            0,
+            TcpFlags::SYN,
+            &[],
+        );
+        let acknowledgement = tcp_frame(
+            REMOTE_PORT,
+            TCP_ECHO_PORT,
+            REMOTE_SEQUENCE + 1,
+            DEFAULT_TCP_INITIAL_SEQUENCE + 1,
+            TcpFlags::ACK,
+            &[],
+        );
+        let mut interface = interface();
+        assert!(interface.process_frame(&syn).unwrap().is_some());
+
+        let reply = interface.process_frame(&acknowledgement).unwrap();
+
+        assert_eq!(reply, None);
+        let key = TcpConnectionKey {
+            local_ip: LOCAL_IP,
+            local_port: TCP_ECHO_PORT,
+            remote_ip: REMOTE_IP,
+            remote_port: REMOTE_PORT,
+        };
+        let connection = interface.tcp_connection(key).unwrap();
+        assert_eq!(connection.state, TcpConnectionState::Established);
+        assert_eq!(
+            connection.send_unacknowledged,
+            DEFAULT_TCP_INITIAL_SEQUENCE + 1
+        );
     }
 
     #[test]
@@ -858,7 +901,7 @@ mod tests {
 
     #[test]
     fn ignores_tcp_syns_for_an_unbound_port() {
-        let input = tcp_frame(49_152, TCP_ECHO_PORT + 1, 100, TcpFlags::SYN, &[]);
+        let input = tcp_frame(49_152, TCP_ECHO_PORT + 1, 100, 0, TcpFlags::SYN, &[]);
 
         assert_eq!(interface().process_frame(&input), Ok(None));
     }
@@ -1033,7 +1076,7 @@ mod tests {
 
     #[test]
     fn reports_a_tcp_checksum_failure() {
-        let mut input = tcp_frame(49_152, TCP_ECHO_PORT, 100, TcpFlags::SYN, &[]);
+        let mut input = tcp_frame(49_152, TCP_ECHO_PORT, 100, 0, TcpFlags::SYN, &[]);
         let checksum_index = ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN + 16;
         input[checksum_index] ^= 1;
 
